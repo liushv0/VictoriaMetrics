@@ -3,8 +3,16 @@ package prometheus
 import (
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/metricsql"
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
+	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/storage/remote"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"math"
 	"net/http"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1182,4 +1190,219 @@ func (sw *scalableWriter) flush() error {
 		return err == nil
 	})
 	return sw.bw.Flush()
+}
+
+const maxSampleInChunk = 10000
+const maxSizeOfFrame = 1024 * 1024
+const contentTypeHeader = "Content-Type"
+const chunkedContentType = "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse"
+const sampleContentType = "application/x-protobuf"
+
+// RemoteReadHandler handler api/v1/read request, will use streamed response if client support
+// todo 对象池化; 代码优化;
+func RemoteReadHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
+	req, err := remote.DecodeReadRequest(r)
+	if err != nil {
+		return err
+	}
+	respType, err := responseType(req.AcceptedResponseTypes)
+	if err != nil {
+		return err
+	}
+	resp := &prompb.ReadResponse{Results: make([]*prompb.QueryResult, len(req.Queries))}
+	sq_list := make([]*storage.SearchQuery, len(req.Queries))
+	for i, qry := range req.Queries {
+		lfs := make([]metricsql.LabelFilter, len(qry.Matchers))
+		for midx, matcher := range qry.Matchers {
+			lf := metricsql.LabelFilter{
+				Label:      matcher.Name,
+				Value:      matcher.Value,
+				IsNegative: matcher.Type == prompb.LabelMatcher_NRE || matcher.Type == prompb.LabelMatcher_NEQ,
+				IsRegexp:   matcher.Type == prompb.LabelMatcher_RE || matcher.Type == prompb.LabelMatcher_NRE,
+			}
+			lfs[midx] = lf
+		}
+		tfs := searchutils.ToTagFilters(lfs)
+		tfss := searchutils.JoinTagFilterss([][]storage.TagFilter{tfs}, [][]storage.TagFilter{})
+		sq := storage.NewSearchQuery(qry.StartTimestampMs-5*60*1000, qry.EndTimestampMs, tfss, *maxUniqueTimeseries)
+		sq_list[i] = sq
+	}
+	switch respType {
+	case prompb.ReadRequest_STREAMED_XOR_CHUNKS:
+		w.Header().Set(contentTypeHeader, chunkedContentType)
+		f, ok := w.(http.Flusher)
+		if !ok {
+			return fmt.Errorf("http.ResponseWriter %s does not implement http.Flusher interface", reflect.TypeOf(w).String())
+		}
+
+		cw := remote.NewChunkedWriter(w, f)
+		for idx, sq := range sq_list {
+			rss, err := netstorage.ProcessSearchQuery(qt, sq, searchutils.GetDeadlineForQuery(r, startTime))
+			if err != nil {
+				return err
+			}
+			ts_ch := make(chan *prompb.TimeSeries, 10)
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case ts, ok := <-ts_ch:
+						if !ok {
+							return
+						}
+						chunkWriter(cw, ts, int64(idx))
+					}
+				}
+			}()
+
+			rss.RunParallel(qt, func(rs *netstorage.Result, workerID uint) error {
+				ts := &prompb.TimeSeries{}
+				ts.Labels = append(ts.Labels, prompb.Label{
+					Name:  "__name__",
+					Value: string(rs.MetricName.MetricGroup),
+				})
+				for _, tag := range rs.MetricName.Tags {
+					ts.Labels = append(ts.Labels, prompb.Label{
+						Name:  string(tag.Key),
+						Value: string(tag.Value),
+					})
+				}
+				for i := range rs.Timestamps {
+					ts.Samples = append(ts.Samples, prompb.Sample{Value: rs.Values[i], Timestamp: rs.Timestamps[i]})
+				}
+				ts_ch <- ts
+				return nil
+			})
+			close(ts_ch)
+			wg.Wait()
+		}
+	case prompb.ReadRequest_SAMPLES:
+		for idx, sq := range sq_list {
+			rss, err := netstorage.ProcessSearchQuery(qt, sq, searchutils.GetDeadlineForQuery(r, startTime))
+			if err != nil {
+				return err
+			}
+			var ss []*prompb.TimeSeries
+			ts_ch := make(chan *prompb.TimeSeries, 10)
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case ts, ok := <-ts_ch:
+						if !ok {
+							return
+						}
+						ss = append(ss, ts)
+					}
+				}
+			}()
+
+			rss.RunParallel(qt, func(rs *netstorage.Result, workerID uint) error {
+				ts := &prompb.TimeSeries{}
+				ts.Labels = append(ts.Labels, prompb.Label{
+					Name:  "__name__",
+					Value: string(rs.MetricName.MetricGroup),
+				})
+				for _, tag := range rs.MetricName.Tags {
+					ts.Labels = append(ts.Labels, prompb.Label{
+						Name:  string(tag.Key),
+						Value: string(tag.Value),
+					})
+				}
+				for i := range rs.Timestamps {
+					ts.Samples = append(ts.Samples, prompb.Sample{Value: rs.Values[i], Timestamp: rs.Timestamps[i]})
+				}
+				ts_ch <- ts
+				return nil
+			})
+
+			close(ts_ch)
+			wg.Wait()
+			resp.Results[idx] = &prompb.QueryResult{Timeseries: ss}
+		}
+		if data, err := proto.Marshal(resp); err != nil {
+			return err
+		} else {
+			compressed := snappy.Encode(nil, data)
+			w.Header().Set(contentTypeHeader, sampleContentType)
+			w.Header().Set("Content-Encoding", "snappy")
+			if _, err := w.Write(compressed); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported resp type: %s", respType)
+	}
+	return nil
+}
+
+func responseType(accepted []prompb.ReadRequest_ResponseType) (prompb.ReadRequest_ResponseType, error) {
+	if len(accepted) > 0 {
+		for _, typ := range accepted {
+			if typ == prompb.ReadRequest_STREAMED_XOR_CHUNKS {
+				return prompb.ReadRequest_STREAMED_XOR_CHUNKS, nil
+			}
+		}
+	}
+	return prompb.ReadRequest_SAMPLES, nil
+}
+
+func chunkWriter(cw *remote.ChunkedWriter, ts *prompb.TimeSeries, idx int64) error {
+	if ts == nil || len(ts.Samples) == 0 {
+		return nil
+	}
+	var chks []prompb.Chunk
+	samples := ts.Samples
+	size := 0
+	for {
+		if len(samples) <= 0 {
+			break
+		}
+		s_len := maxSampleInChunk
+		if s_len > len(samples) {
+			s_len = len(samples)
+		}
+		s_arr := samples[:s_len]
+		samples = samples[s_len:]
+		chk := chunkenc.NewXORChunk()
+		appender, err := chk.Appender()
+		if err != nil {
+			return errors.Wrap(err, "new XORChunk")
+		}
+		for _, s := range s_arr {
+			appender.Append(s.Timestamp, s.Value)
+		}
+		pChk := prompb.Chunk{
+			MinTimeMs: s_arr[0].Timestamp,
+			MaxTimeMs: s_arr[s_len-1].Timestamp,
+			Type:      prompb.Chunk_Encoding(chk.Encoding()),
+			Data:      chk.Bytes(),
+		}
+		chks = append(chks, pChk)
+		size += pChk.Size()
+		if (size >= maxSizeOfFrame || len(samples) <= 0) && len(chks) > 0 {
+			b, err := proto.Marshal(&prompb.ChunkedReadResponse{
+				ChunkedSeries: []*prompb.ChunkedSeries{
+					{
+						Labels: ts.Labels,
+						Chunks: chks,
+					},
+				},
+				QueryIndex: idx,
+			})
+			if err != nil {
+				return errors.Wrap(err, "marshal ChunkedReadResponse")
+			}
+			if _, err = cw.Write(b); err != nil {
+				return errors.Wrap(err, "write to stream")
+			}
+			size = 0
+			chks = chks[:0]
+		}
+	}
+	return nil
 }

@@ -1,3 +1,17 @@
+# 说明
+基于VictoriaMetrics v1.87 LTS版本扩展，因为v1.90版本是不兼容升级，暂时不准备跟进；
+
+## 计划增加以下功能：
+1，支持remote read接口
+2，降采样功能
+3，TODO
+
+
+以下是原始的README
+---
+
+
+
 # VictoriaMetrics
 
 [![Latest Release](https://img.shields.io/github/release/VictoriaMetrics/VictoriaMetrics.svg?style=flat-square)](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest)

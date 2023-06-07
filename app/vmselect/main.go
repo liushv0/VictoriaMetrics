@@ -274,6 +274,15 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		return true
+	case "/api/v1/read":
+		remoteReadRequests.Inc()
+		httpserver.EnableCORS(w, r)
+		if err := prometheus.RemoteReadHandler(qt, startTime, w, r); err != nil {
+			remoteReadErrors.Inc()
+			sendPrometheusError(w, r, err)
+			return true
+		}
+		return true
 	case "/api/v1/series":
 		seriesRequests.Inc()
 		httpserver.EnableCORS(w, r)
@@ -631,6 +640,9 @@ var (
 	metadataRequests       = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/metadata"}`)
 	buildInfoRequests      = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/buildinfo"}`)
 	queryExemplarsRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/query_exemplars"}`)
+
+	remoteReadRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/read"}`)
+	remoteReadErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/read"}`)
 )
 
 func proxyVMAlertRequests(w http.ResponseWriter, r *http.Request) {
