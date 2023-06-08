@@ -63,6 +63,9 @@ package-victoria-metrics-386:
 publish-victoria-metrics:
 	APP_NAME=victoria-metrics $(MAKE) publish-via-docker
 
+push-victoria-metrics-amd64:
+	APP_NAME=victoria-metrics $(MAKE) push-via-docker-amd64
+
 run-victoria-metrics:
 	mkdir -p victoria-metrics-data
 	DOCKER_OPTS='-v $(shell pwd)/victoria-metrics-data:/victoria-metrics-data' \

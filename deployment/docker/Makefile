@@ -70,6 +70,9 @@ package-via-docker: package-base
 			--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE) \
 			-f app/$(APP_NAME)/deployment/Dockerfile bin)
 
+push-via-docker:
+	docker push $(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE)
+
 publish-via-docker: \
 	app-via-docker-linux-amd64 \
 	app-via-docker-linux-arm \
@@ -140,6 +143,13 @@ app-via-docker-windows-amd64:
 	APP_SUFFIX='-$(GOARCH)' \
 	DOCKER_OPTS='--env CGO_ENABLED=0 --env GOOS=windows --env GOARCH=amd64' \
 	$(MAKE) app-via-docker-windows
+
+push-via-docker-goarch:
+	APP_SUFFIX='-$(GOARCH)' \
+	$(MAKE) push-via-docker
+
+push-via-docker-amd64:
+	GOARCH=amd64 $(MAKE) push-via-docker-goarch
 
 package-via-docker-goarch:
 	APP_SUFFIX='-$(GOARCH)' \
