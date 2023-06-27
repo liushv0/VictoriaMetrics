@@ -21,6 +21,7 @@ type Set struct {
 	// Most likely the buckets contains only a single item, so put it here for performance reasons
 	// in order to improve memory locality.
 	scratchBuckets [1]bucket32
+	truncated      bool
 }
 
 type bucket32Sorter []bucket32
@@ -396,6 +397,21 @@ func (s *Set) ForEach(f func(part []uint64) bool) {
 	}
 }
 
+func (s *Set) Truncate(retain int) {
+	retain_raw := retain
+	for i := range s.buckets {
+		retain = s.buckets[i].truncate(retain)
+	}
+	if retain <= 0 {
+		s.truncated = true
+		s.itemsCount = retain_raw
+	}
+}
+
+func (s *Set) isTruncated() bool {
+	return s.truncated
+}
+
 type bucket32 struct {
 	hi uint32
 
@@ -697,6 +713,17 @@ func (b *bucket32) appendTo(dst []uint64) []uint64 {
 	return dst
 }
 
+func (b *bucket32) truncate(retain int) int {
+	bl := b.getLen()
+	if retain >= bl {
+		return retain - bl
+	}
+	for i := 0; i < len(b.buckets); i++ {
+		retain = b.buckets[i].truncate(retain)
+	}
+	return 0
+}
+
 const (
 	bitsPerBucket  = 1 << 16
 	wordsPerBucket = bitsPerBucket / 64
@@ -938,6 +965,42 @@ func (b *bucket16) appendTo(dst []uint64, hi uint32, hi16 uint16) []uint64 {
 		wordNum++
 	}
 	return dst
+}
+
+func (b *bucket16) truncate(retain int) int {
+	if retain <= 0 {
+		b.bits = nil
+		b.smallPoolLen = 0
+		return 0
+	}
+	bl := b.getLen()
+	if retain >= bl {
+		return retain - bl
+	}
+
+	if b.bits == nil {
+		b.smallPoolLen = retain
+		return 0
+	}
+	for i := 0; i < len(b.bits); i++ {
+		word := b.bits[i]
+		if retain <= 0 || word == 0 {
+			b.bits[i] = 0
+			continue
+		}
+		w_1_cnt := bits.OnesCount64(word)
+		if retain >= w_1_cnt {
+			retain -= w_1_cnt
+			continue
+		}
+		for n := 0; n < w_1_cnt-retain; n++ {
+			word = word & (word - 1)
+		}
+		b.bits[i] = word
+		retain = 0
+	}
+
+	return 0
 }
 
 var smallPoolSorterPool = &sync.Pool{
